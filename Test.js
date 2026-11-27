@@ -1,97 +1,86 @@
-var col = db.getCollection('SITcalculations_test');
-var totalModified = 0;
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 
-while (true) {
-  // 1. Fetch up to 500 matching _ids
-  var batchIds = col.find(
-    { "payload.sitCalcs.BA": { $in: ["CPLE", "CPLW"] } },
-    { "_id": 1 }
-  ).limit(500).toArray().map(function(doc) { return doc._id; });
+MONGO_URI = "mongodb://localhost:27017/"
+DATABASE_NAME = "YourDatabase"
 
-  // Stop when no matching documents remain
-  if (batchIds.length === 0) {
-    break;
-  }
+client = MongoClient(MONGO_URI)
 
-  // 2. Update only this batch of 500 documents
-  var res = col.updateMany(
-    { "_id": { $in: batchIds } },
-    [
-      {
-        $set: {
-          "payload.sitCalcs": {
-            $ifNull: [
-              {
-                $let: {
-                  vars: {
-                    movedMeasurements: {
-                      $reduce: {
-                        input: {
-                          $filter: {
-                            input: "$payload.sitCalcs",
-                            as: "c",
-                            cond: { $in: ["$$c.BA", ["CPLE", "CPLW"]] }
-                          }
-                        },
-                        initialValue: [],
-                        in: {
-                          $concatArrays: [
-                            "$$value",
-                            { $ifNull: ["$$this.Measurements", []] }
-                          ]
-                        }
-                      }
-                    },
-                    remainingCalcs: {
-                      $filter: {
-                        input: "$payload.sitCalcs",
-                        as: "c",
-                        cond: { $not: { $in: ["$$c.BA", ["CPLE", "CPLW"]] } }
-                      }
-                    }
-                  },
-                  in: {
-                    $map: {
-                      input: "$$remainingCalcs",
-                      as: "item",
-                      in: {
-                        $cond: [
-                          {
-                            $and: [
-                              { $eq: ["$$item.BA", "DUK"] },
-                              { $eq: ["$$item.RC", "VACAR"] }
-                            ]
-                          },
-                          {
-                            $mergeObjects: [
-                              "$$item",
-                              {
-                                Measurements: {
-                                  $concatArrays: [
-                                    { $ifNull: ["$$item.Measurements", []] },
-                                    "$$movedMeasurements"
-                                  ]
-                                }
-                              }
-                            ]
-                          },
-                          "$$item"
-                        ]
-                      }
-                    }
-                  }
+try:
+    db = client[DATABASE_NAME]
+    collection = db["generation_test_ba_move"]
+
+    # 1. Filter documents containing CPLE/CPLW
+    #    in measurements OR badatalinkstatus
+
+    query = {
+        "$or": [
+            {
+                "payload.measurements.BA": {
+                    "$in": ["CPLE", "CPLW"]
                 }
-              },
-              "$payload.sitCalcs"
-            ]
-          }
+            },
+            {
+                "payload.badatalinkstatus.VACAR|CPLE,Minneapolis": {
+                    "$exists": True
+                }
+            },
+            {
+                "payload.badatalinkstatus.VACAR|CPLE,Bloomington": {
+                    "$exists": True
+                }
+            },
+            {
+                "payload.badatalinkstatus.VACAR|CPLW,Minneapolis": {
+                    "$exists": True
+                }
+            },
+            {
+                "payload.badatalinkstatus.VACAR|CPLW,Bloomington": {
+                    "$exists": True
+                }
+            }
+        ]
+    }
+
+    # 2. Update matching measurements and remove old keys
+
+    update = {
+        "$set": {
+            "payload.measurements.$[elem].BA": "DUK"
+        },
+        "$unset": {
+            "payload.badatalinkstatus.VACAR|CPLE,Minneapolis": "",
+            "payload.badatalinkstatus.VACAR|CPLE,Bloomington": "",
+            "payload.badatalinkstatus.VACAR|CPLW,Minneapolis": "",
+            "payload.badatalinkstatus.VACAR|CPLW,Bloomington": ""
         }
-      }
+    }
+
+    # 3. Apply update only to matching array elements
+
+    array_filters = [
+        {
+            "elem.BA": {
+                "$in": ["CPLE", "CPLW"]
+            }
+        }
     ]
-  );
 
-  totalModified += res.modifiedCount;
-  print("SITcalculations updated so far: " + totalModified);
-}
+    # 4. Execute update
 
-print("DONE! Total SITcalculations updated: " + totalModified);
+    result = collection.update_many(
+        query,
+        update,
+        array_filters=array_filters
+    )
+
+    print("Update completed successfully")
+    print(f"Matched documents: {result.matched_count}")
+    print(f"Modified documents: {result.modified_count}")
+
+except PyMongoError as ex:
+    print(f"MongoDB error: {ex}")
+
+finally:
+    client.close()
