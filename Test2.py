@@ -12,7 +12,7 @@ GENERATORS_COLLECTION = "Generators"        # <-- Used by SIT.py InitializeAreas
 BATCH_SIZE = 500
 TEMP_INDEX_NAME = "idx_sitCalcs_BA_temp"
 
-# --- SIT.py Constants (Verify against top of SIT.py / Parameters collection) ---
+# --- SIT.py Constants (Verify against Parameters collection / top of SIT.py) ---
 CONTINGENCY = 2750.0   # <-- Replace with exact 'contingency' value
 UFLS = 59.5            # <-- Replace with exact 'ufls' value
 QUALITY_LIMIT = 100    # <-- Replace with exact 'qualitylimit' value
@@ -103,11 +103,14 @@ def update_generation_collection(db):
     print(f"Generation Matched: {res.matched_count} | Modified: {res.modified_count}\n")
 
 
-def compute_duk_sit_py(measurements, statuses, areas):
-    """Exact SIT.py Compute() logic for VACAR|DUK."""
+def compute_duk_from_generation(gen_payload, areas):
+    """Exact SIT.py Compute() logic for VACAR|DUK using linked generation measurements & badatalinkstatus."""
+    measurements = gen_payload.get("measurements", [])
+    statuses = gen_payload.get("badatalinkstatus", {})
+
     mva_total = 0.0
     sir_total = 0.0
-    duk_ids = []
+    duk_measurements = []
 
     for m in measurements:
         if m.get("RC") != "VACAR" or m.get("BA") != "DUK":
@@ -139,7 +142,7 @@ def compute_duk_sit_py(measurements, statuses, areas):
 
         mva_total += mvabase
         sir_total += si_base
-        duk_ids.append({
+        duk_measurements.append({
             "id": gen_id,
             "value": mw,
             "quality": quality,
@@ -153,7 +156,7 @@ def compute_duk_sit_py(measurements, statuses, areas):
     time_to_ufls = round((60.0 - UFLS) / rocof_total, 4) if rocof_total != 0 else 0
     ei_inertia = round(sir_total / mva_total, 3) if mva_total != 0 else 0.0
 
-    # percentG calculation from statuses (Image 5, lines 339-346)
+    # percentG read from generation's payload.badatalinkstatus (lines 339-346 of SIT.py)
     try:
         mk = "VACAR|DUK,Minneapolis"
         bk = "VACAR|DUK,Bloomington"
@@ -175,13 +178,13 @@ def compute_duk_sit_py(measurements, statuses, areas):
         "TimeToUFLS": time_to_ufls,
         "EIInertiaConstant": ei_inertia,
         "percentG": percent_g,
-        "Measurements": duk_ids,
+        "Measurements": duk_measurements,
     }
 
 
 def recalculate_sit_collection(db, areas):
-    """Step 4: Recalculate VACAR|DUK in SITcalculations_test via linked snapshotIDs."""
-    print(f"--- Step 4: Recalculating {SIT_COLLECTION} ---")
+    """Step 4: Link SITcalculations_test to generation_test_ba_move via snapshotID and update sitCalcs."""
+    print(f"--- Step 4: Updating {SIT_COLLECTION} via linked {GENERATION_COLLECTION} ---")
     sit_col = db[SIT_COLLECTION]
     gen_col = db[GENERATION_COLLECTION]
 
@@ -222,22 +225,19 @@ def recalculate_sit_collection(db, areas):
                 if not gen_payload:
                     continue
 
-                new_duk_calc = compute_duk_sit_py(
-                    gen_payload.get("measurements", []),
-                    gen_payload.get("badatalinkstatus", {}),
-                    areas,
-                )
+                new_duk_calc = compute_duk_from_generation(gen_payload, areas)
 
-                filtered_calcs = [
+                # Remove CPLE, CPLW, and old DUK (VACAR), then insert updated DUK
+                updated_calcs = [
                     c for c in doc.get("payload", {}).get("sitCalcs", [])
                     if c.get("BA") not in ("CPLE", "CPLW")
                     and not (c.get("BA") == "DUK" and c.get("RC") == "VACAR")
                 ]
-                filtered_calcs.append(new_duk_calc)
+                updated_calcs.append(new_duk_calc)
 
                 res = sit_col.update_one(
                     {"_id": doc["_id"]},
-                    {"$set": {"payload.sitCalcs": filtered_calcs}},
+                    {"$set": {"payload.sitCalcs": updated_calcs}},
                 )
                 batch_modified += res.modified_count
 
@@ -258,7 +258,7 @@ def main():
         areas = update_and_load_mongo_generators(db)
         update_generation_collection(db)
         recalculate_sit_collection(db, areas)
-        print("All migration and SIT.py recalculation steps completed.")
+        print("All migration and recalculation steps completed.")
     except (PyMongoError, psycopg2.Error) as err:
         print(f"Database error: {err}")
     finally:
@@ -267,4 +267,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
