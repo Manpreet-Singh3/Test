@@ -5,13 +5,14 @@ from pymongo.errors import PyMongoError
 
 # --- MongoDB Configuration ---
 MONGO_URI = "mongodb://localhost:27017/"
-MONGO_DB_NAME = "your_operational_db"  # <-- Match exact DB name in Studio 3T
+MONGO_DB_NAME = "your_operational_db"       # <-- Match exact DB name in Studio 3T
 GENERATION_COLLECTION = "generation_test_ba_move"
 SIT_COLLECTION = "SITcalculations_test"
+GENERATORS_COLLECTION = "Generators"        # <-- Used by SIT.py InitializeAreas()
 BATCH_SIZE = 500
 TEMP_INDEX_NAME = "idx_sitCalcs_BA_temp"
 
-# --- SITDataRecalc Constants (Verify against top of SITDataRecalc.py) ---
+# --- SIT.py Constants (Verify against top of SIT.py / Parameters collection) ---
 CONTINGENCY = 2750.0   # <-- Replace with exact 'contingency' value
 UFLS = 59.5            # <-- Replace with exact 'ufls' value
 QUALITY_LIMIT = 100    # <-- Replace with exact 'qualitylimit' value
@@ -26,22 +27,8 @@ PG_CONFIG = {
 }
 
 
-def load_generator_metadata(conn):
-    """Loads generator mvaBase and inertia from PostgreSQL after updating BA to DUK."""
-    pg_generators = {}
-    with conn.cursor() as cur:
-        # Adjust column names if your table uses different casing (e.g., mvabase, inertia)
-        cur.execute("SELECT id, mvabase, inertia FROM public.generators WHERE rc = 'VACAR' AND ba = 'DUK';")
-        for row in cur.fetchall():
-            pg_generators[row[0]] = {
-                "mvaBase": float(row[1] or 0.0),
-                "inertia": float(row[2] or 0.0),
-            }
-    return pg_generators
-
-
 def update_postgres():
-    """Step 1: Delete CPLE/CPLW from public.bas, reassign generators to DUK, and return DUK metadata."""
+    """Step 1: Delete CPLE/CPLW from public.bas and reassign generators to DUK in PostgreSQL."""
     print("--- Step 1: Updating PostgreSQL ---")
     conn = psycopg2.connect(**PG_CONFIG)
     try:
@@ -51,18 +38,45 @@ def update_postgres():
                 print(f"Deleted {cur.rowcount} rows from public.bas")
 
                 cur.execute("UPDATE public.generators SET ba = 'DUK' WHERE rc = 'VACAR' AND ba IN ('CPLE', 'CPLW');")
-                print(f"Updated {cur.rowcount} rows in public.generators")
-
-        pg_generators = load_generator_metadata(conn)
-        print(f"Loaded {len(pg_generators)} VACAR|DUK generators from PostgreSQL.\n")
-        return pg_generators
+                print(f"Updated {cur.rowcount} rows in public.generators\n")
     finally:
         conn.close()
 
 
+def update_and_load_mongo_generators(db):
+    """Step 2: Update BA to DUK in MongoDB Generators collection and load 'areas' dict like SIT.py."""
+    print(f"--- Step 2: Updating & Loading MongoDB {GENERATORS_COLLECTION} ---")
+    gen_meta_col = db[GENERATORS_COLLECTION]
+
+    res = gen_meta_col.update_many(
+        {"rc": "VACAR", "ba": {"$in": ["CPLE", "CPLW"]}},
+        {"$set": {"ba": "DUK"}},
+    )
+    print(f"Updated {res.modified_count} documents in MongoDB {GENERATORS_COLLECTION}.")
+
+    areas = {}
+    projection = {
+        "_id": 0, "inertia": 1, "rc": 1, "ba": 1,
+        "mvaBase": 1, "iccpId": 1, "psseBusName": 1, "machineId": 1,
+    }
+    for item in gen_meta_col.find({}, projection):
+        iccp_id = item.get("iccpId")
+        if iccp_id:
+            areas[iccp_id] = {
+                "Inertia": item.get("inertia", 0.0),
+                "RC": item.get("rc"),
+                "BA": item.get("ba"),
+                "MVABase": item.get("mvaBase", 0.0),
+                "psseBusName": item.get("psseBusName"),
+                "machineId": item.get("machineId"),
+            }
+    print(f"Loaded {len(areas)} generator entries into areas lookup.\n")
+    return areas
+
+
 def update_generation_collection(db):
-    """Step 2: Update generation measurements to DUK and remove old badatalinkstatus keys."""
-    print(f"--- Step 2: Updating {GENERATION_COLLECTION} ---")
+    """Step 3: Update generation measurements to DUK and remove old badatalinkstatus keys."""
+    print(f"--- Step 3: Updating {GENERATION_COLLECTION} ---")
     col = db[GENERATION_COLLECTION]
 
     query = {
@@ -89,50 +103,66 @@ def update_generation_collection(db):
     print(f"Generation Matched: {res.matched_count} | Modified: {res.modified_count}\n")
 
 
-def compute_duk_from_measurements(measurements, pg_generators, gen_data=None):
-    """Exact SITDataRecalc.py Compute() logic for VACAR|DUK using updated generation measurements."""
-    gen_data = gen_data or {}
+def compute_duk_sit_py(measurements, statuses, areas):
+    """Exact SIT.py Compute() logic for VACAR|DUK."""
     mva_total = 0.0
     sir_total = 0.0
-    duk_measurements = []
+    duk_ids = []
 
     for m in measurements:
         if m.get("RC") != "VACAR" or m.get("BA") != "DUK":
             continue
 
+        gen_id = m.get("ID")
+        if gen_id not in areas:
+            continue
+
         mw = m.get("value", 0.0)
         mw1 = mw
+        mvabase_gen = areas[gen_id]["MVABase"]
+        psse_bus_name = areas[gen_id]["psseBusName"]
+        machine_id = areas[gen_id]["machineId"]
+        mvabase = mvabase_gen
+
+        if mw < 0.5:
+            mw = 0
+            mw1 = 0
+            mvabase = 0
+
         quality = m.get("Q", 0)
-        gen_id = m.get("ID")
+        if quality >= QUALITY_LIMIT and quality < 128:
+            mw1 = 0
+            mvabase = 0
 
-        if gen_id in gen_data:
-            mvabase = float(gen_data[gen_id]["MVABase"])
-            if mw < 0.5:
-                mw, mw1, mvabase = 0.0, 0.0, 0.0
-            if quality >= QUALITY_LIMIT:
-                mw1, mvabase = 0.0, 0.0
-            inertia = float(gen_data[gen_id]["Inertia"])
-            si_base = float(mvabase) * inertia if mw1 is not None else 0.0
-            mva_total += mvabase
-            sir_total += si_base
-            duk_measurements.append({"id": gen_id, "value": mw, "quality": quality})
+        inertia = areas[gen_id]["Inertia"]
+        si_base = float(mvabase) * float(inertia) if mw1 is not None else 0
 
-        elif gen_id in pg_generators:
-            mvabase = pg_generators[gen_id]["mvaBase"]
-            inertia = pg_generators[gen_id]["inertia"]
-            if mw < 0.5:
-                mw, mw1, mvabase = 0.0, 0.0, 0.0
-            if quality >= QUALITY_LIMIT:
-                mw1, mvabase = 0.0, 0.0
-            si_base = float(mvabase) * float(inertia) if mw1 is not None else 0.0
-            mva_total += mw1
-            sir_total += si_base
-            duk_measurements.append({"id": gen_id, "value": mw, "quality": quality})
+        mva_total += mvabase
+        sir_total += si_base
+        duk_ids.append({
+            "id": gen_id,
+            "value": mw,
+            "quality": quality,
+            "psseBusName": psse_bus_name,
+            "machineId": machine_id,
+            "mva": mvabase_gen,
+            "inertia": inertia,
+        })
 
-    rocof = 0.0 if sir_total == 0.0 else (CONTINGENCY / (2.0 * sir_total)) * 60.0
-    freq_dev = round(rocof / 2.0, 3)
-    time_to_ufls = 0.0 if rocof == 0.0 else round((60.0 - UFLS) / rocof, 4)
-    ei_inertia = 0.0 if mva_total == 0.0 else round(sir_total / mva_total, 3)
+    rocof_total = 0 if sir_total == 0.0 else (CONTINGENCY / (2.0 * sir_total)) * 60.0
+    time_to_ufls = round((60.0 - UFLS) / rocof_total, 4) if rocof_total != 0 else 0
+    ei_inertia = round(sir_total / mva_total, 3) if mva_total != 0 else 0.0
+
+    # percentG calculation from statuses (Image 5, lines 339-346)
+    try:
+        mk = "VACAR|DUK,Minneapolis"
+        bk = "VACAR|DUK,Bloomington"
+        if statuses[mk]["percentG"] > statuses[bk]["percentG"]:
+            percent_g = statuses[mk]["percentG"]
+        else:
+            percent_g = statuses[bk]["percentG"]
+    except Exception:
+        percent_g = 0
 
     return {
         "BA": "DUK",
@@ -140,17 +170,18 @@ def compute_duk_from_measurements(measurements, pg_generators, gen_data=None):
         "Type": 0,
         "MVA": round(mva_total, 3),
         "SIR": round(sir_total, 3),
-        "ROCOF": round(rocof, 2),
-        "FreqDev": freq_dev,
+        "ROCOF": round(rocof_total, 2),
+        "FreqDev": round(rocof_total / 2, 3),
         "TimeToUFLS": time_to_ufls,
         "EIInertiaConstant": ei_inertia,
-        "Measurements": duk_measurements,
+        "percentG": percent_g,
+        "Measurements": duk_ids,
     }
 
 
-def recalculate_sit_collections(db, pg_generators, gen_data=None):
-    """Step 3: Recalculate VACAR|DUK in SITcalculations_test using linked generation snapshotIDs."""
-    print(f"--- Step 3: Recalculating {SIT_COLLECTION} from {GENERATION_COLLECTION} ---")
+def recalculate_sit_collection(db, areas):
+    """Step 4: Recalculate VACAR|DUK in SITcalculations_test via linked snapshotIDs."""
+    print(f"--- Step 4: Recalculating {SIT_COLLECTION} ---")
     sit_col = db[SIT_COLLECTION]
     gen_col = db[GENERATION_COLLECTION]
 
@@ -170,27 +201,33 @@ def recalculate_sit_collections(db, pg_generators, gen_data=None):
                 break
 
             batch_number += 1
-            snapshot_ids = [d.get("header", {}).get("snapshotID") for d in sit_docs if d.get("header", {}).get("snapshotID")]
+            snapshot_ids = [
+                d.get("header", {}).get("snapshotID")
+                for d in sit_docs
+                if d.get("header", {}).get("snapshotID")
+            ]
 
-            # Fetch linked generation documents in bulk for this batch
             gen_map = {
-                g["header"]["snapshotID"]: g.get("payload", {}).get("measurements", [])
+                g["header"]["snapshotID"]: g.get("payload", {})
                 for g in gen_col.find(
                     {"header.snapshotID": {"$in": snapshot_ids}},
-                    {"header.snapshotID": 1, "payload.measurements": 1},
+                    {"header.snapshotID": 1, "payload.measurements": 1, "payload.badatalinkstatus": 1},
                 )
             }
 
             batch_modified = 0
             for doc in sit_docs:
                 snap_id = doc.get("header", {}).get("snapshotID")
-                measurements = gen_map.get(snap_id)
-                if not measurements:
+                gen_payload = gen_map.get(snap_id)
+                if not gen_payload:
                     continue
 
-                new_duk_calc = compute_duk_from_measurements(measurements, pg_generators, gen_data)
+                new_duk_calc = compute_duk_sit_py(
+                    gen_payload.get("measurements", []),
+                    gen_payload.get("badatalinkstatus", {}),
+                    areas,
+                )
 
-                # Remove CPLE, CPLW, and old DUK (VACAR), then insert recalculated DUK
                 filtered_calcs = [
                     c for c in doc.get("payload", {}).get("sitCalcs", [])
                     if c.get("BA") not in ("CPLE", "CPLW")
@@ -210,18 +247,18 @@ def recalculate_sit_collections(db, pg_generators, gen_data=None):
     finally:
         if TEMP_INDEX_NAME in sit_col.index_information():
             sit_col.drop_index(TEMP_INDEX_NAME)
-        print(f"Step 3 Complete -> Total Modified: {total_modified}\n")
+        print(f"Step 4 Complete -> Total Modified: {total_modified}\n")
 
 
 def main():
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30000, socketTimeoutMS=None)
     try:
-        pg_generators = update_postgres()
+        update_postgres()
         db = client[MONGO_DB_NAME]
+        areas = update_and_load_mongo_generators(db)
         update_generation_collection(db)
-        # Note: If you also have a static 'generatorData' dict/table in your app, pass it as gen_data
-        recalculate_sit_collections(db, pg_generators, gen_data=None)
-        print("All migration and SIT recalculation steps completed.")
+        recalculate_sit_collection(db, areas)
+        print("All migration and SIT.py recalculation steps completed.")
     except (PyMongoError, psycopg2.Error) as err:
         print(f"Database error: {err}")
     finally:
