@@ -1,180 +1,257 @@
-
-from pymongo import MongoClient, ASCENDING
 import time
+import psycopg2
+from pymongo import MongoClient, ASCENDING
+from pymongo.errors import PyMongoError
 
-client = MongoClient(
-    "mongodb://localhost:27017/",
-    serverSelectionTimeoutMS=30000,
-    socketTimeoutMS=None
-)
-
-db = client["YOUR_DATABASE"]
-col = db["SITcalculations_test"]
-
+# --- MongoDB Configuration ---
+MONGO_URI = "mongodb://localhost:27017/"
+MONGO_DB_NAME = "YourDatabase"  # Update to your actual MongoDB database name
+GENERATION_COLLECTION = "generation_test_ba_move"
+SIT_COLLECTION = "SITcalculations_test"
 BATCH_SIZE = 500
-INDEX_NAME = "idx_sitCalcs_BA_temp"
+TEMP_INDEX_NAME = "idx_sitCalcs_BA_temp"
 
-total_modified = 0
-batch_number = 0
+# --- PostgreSQL Configuration ---
+PG_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "your_postgres_db",  # Update to your PostgreSQL database name
+    "user": "your_username",       # Update to your PostgreSQL username
+    "password": "your_password",   # Update to your PostgreSQL password
+}
 
-start_time = time.time()
 
-try:
-    # 1. Create temporary index
-    print("Creating temporary index...")
+def update_generation_collection(db):
+    """Step 1 (MongoDB): Updates BA values from CPLE/CPLW to DUK and removes old badatalinkstatus keys."""
+    print(f"--- Starting Step 1 (MongoDB): {GENERATION_COLLECTION} ---")
+    collection = db[GENERATION_COLLECTION]
 
-    col.create_index(
-        [("payload.sitCalcs.BA", ASCENDING)],
-        name=INDEX_NAME
-    )
+    query = {
+        "$or": [
+            {"payload.measurements.BA": {"$in": ["CPLE", "CPLW"]}},
+            {"payload.badatalinkstatus.VACAR|CPLE,Minneapolis": {"$exists": True}},
+            {"payload.badatalinkstatus.VACAR|CPLE,Bloomington": {"$exists": True}},
+            {"payload.badatalinkstatus.VACAR|CPLW,Minneapolis": {"$exists": True}},
+            {"payload.badatalinkstatus.VACAR|CPLW,Bloomington": {"$exists": True}},
+        ]
+    }
 
-    print("Index created successfully.")
+    update = {
+        "$set": {
+            "payload.measurements.$[elem].BA": "DUK"
+        },
+        "$unset": {
+            "payload.badatalinkstatus.VACAR|CPLE,Minneapolis": "",
+            "payload.badatalinkstatus.VACAR|CPLE,Bloomington": "",
+            "payload.badatalinkstatus.VACAR|CPLW,Minneapolis": "",
+            "payload.badatalinkstatus.VACAR|CPLW,Bloomington": "",
+        },
+    }
 
-    # 2. Aggregation update pipeline
-    pipeline = [
-        {
-            "$set": {
-                "payload.sitCalcs": {
-                    "$let": {
-                        "vars": {
-                            "movedMeasurements": {
-                                "$reduce": {
-                                    "input": {
-                                        "$filter": {
-                                            "input": "$payload.sitCalcs",
-                                            "as": "c",
-                                            "cond": {
-                                                "$in": [
-                                                    "$$c.BA",
-                                                    ["CPLE", "CPLW"]
-                                                ]
+    array_filters = [
+        {"elem.BA": {"$in": ["CPLE", "CPLW"]}}
+    ]
+
+    result = collection.update_many(query, update, array_filters=array_filters)
+
+    print("Step 1 completed successfully.")
+    print(f"Matched documents: {result.matched_count}")
+    print(f"Modified documents: {result.modified_count}\n")
+
+
+def update_sit_calculations_collection(db):
+    """Step 2 (MongoDB): Moves CPLE/CPLW measurements into DUK (VACAR) in batches."""
+    print(f"--- Starting Step 2 (MongoDB): {SIT_COLLECTION} ---")
+    col = db[SIT_COLLECTION]
+
+    total_modified = 0
+    batch_number = 0
+    start_time = time.time()
+
+    try:
+        print("Creating temporary index...")
+        col.create_index([("payload.sitCalcs.BA", ASCENDING)], name=TEMP_INDEX_NAME)
+        print("Index created successfully.")
+
+        pipeline = [
+            {
+                "$set": {
+                    "payload.sitCalcs": {
+                        "$let": {
+                            "vars": {
+                                "movedMeasurements": {
+                                    "$reduce": {
+                                        "input": {
+                                            "$filter": {
+                                                "input": "$payload.sitCalcs",
+                                                "as": "c",
+                                                "cond": {
+                                                    "$in": ["$$c.BA", ["CPLE", "CPLW"]]
+                                                },
                                             }
-                                        }
-                                    },
-                                    "initialValue": [],
-                                    "in": {
-                                        "$concatArrays": [
-                                            "$$value",
-                                            {
-                                                "$ifNull": [
-                                                    "$$this.Measurements", []
-                                                ]
-                                            }
-                                        ]
+                                        },
+                                        "initialValue": [],
+                                        "in": {
+                                            "$concatArrays": [
+                                                "$$value",
+                                                {"$ifNull": ["$$this.Measurements", []]},
+                                            ]
+                                        },
                                     }
+                                },
+                                "remainingCalcs": {
+                                    "$filter": {
+                                        "input": "$payload.sitCalcs",
+                                        "as": "c",
+                                        "cond": {
+                                            "$not": [
+                                                {"$in": ["$$c.BA", ["CPLE", "CPLW"]]}
+                                            ]
+                                        },
+                                    }
+                                },
+                            },
+                            "in": {
+                                "$map": {
+                                    "input": "$$remainingCalcs",
+                                    "as": "item",
+                                    "in": {
+                                        "$cond": [
+                                            {
+                                                "$and": [
+                                                    {"$eq": ["$$item.BA", "DUK"]},
+                                                    {"$eq": ["$$item.RC", "VACAR"]},
+                                                ]
+                                            },
+                                            {
+                                                "$mergeObjects": [
+                                                    "$$item",
+                                                    {
+                                                        "Measurements": {
+                                                            "$concatArrays": [
+                                                                {
+                                                                    "$ifNull": [
+                                                                        "$$item.Measurements",
+                                                                        [],
+                                                                    ]
+                                                                },
+                                                                "$$movedMeasurements",
+                                                            ]
+                                                        }
+                                                    },
+                                                ]
+                                            },
+                                            "$$item",
+                                        ]
+                                    },
                                 }
                             },
-                            "remainingCalcs": {
-                                "$filter": {
-                                    "input": "$payload.sitCalcs",
-                                    "as": "c",
-                                    "cond": {
-                                        "$not": [
-                                            {
-                                                "$in": [
-                                                    "$$c.BA",
-                                                    ["CPLE", "CPLW"]
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                }
-                            }
-                        },
-                        "in": {
-                            "$map": {
-                                "input": "$$remainingCalcs",
-                                "as": "item",
-                                "in": {
-                                    "$cond": [
-                                        {
-                                            "$and": [
-                                                {"$eq": ["$$item.BA", "DUK"]},
-                                                {"$eq": ["$$item.RC", "VACAR"]}
-                                            ]
-                                        },
-                                        {
-                                            "$mergeObjects": [
-                                                "$$item",
-                                                {
-                                                    "Measurements": {
-                                                        "$concatArrays": [
-                                                            {
-                                                                "$ifNull": [
-                                                                    "$$item.Measurements",
-                                                                    []
-                                                                ]
-                                                            },
-                                                            "$$movedMeasurements"
-                                                        ]
-                                                    }
-                                                }
-                                            ]
-                                        },
-                                        "$$item"
-                                    ]
-                                }
-                            }
                         }
                     }
                 }
             }
-        }
-    ]
-
-    # 3. Process in batches
-    while True:
-
-        batch_ids = [
-            doc["_id"]
-            for doc in col.find(
-                {
-                    "payload.sitCalcs.BA": {
-                        "$in": ["CPLE", "CPLW"]
-                    }
-                },
-                {"_id": 1}
-            ).limit(BATCH_SIZE)
         ]
 
-        if not batch_ids:
-            break
+        while True:
+            batch_ids = [
+                doc["_id"]
+                for doc in col.find(
+                    {"payload.sitCalcs.BA": {"$in": ["CPLE", "CPLW"]}},
+                    {"_id": 1},
+                ).limit(BATCH_SIZE)
+            ]
 
-        batch_number += 1
+            if not batch_ids:
+                break
 
-        result = col.update_many(
-            {"_id": {"$in": batch_ids}},
-            pipeline
-        )
+            batch_number += 1
+            result = col.update_many({"_id": {"$in": batch_ids}}, pipeline)
+            total_modified += result.modified_count
 
-        total_modified += result.modified_count
+            print(
+                f"Batch: {batch_number} | "
+                f"Modified: {result.modified_count} | "
+                f"Total: {total_modified} | "
+                f"Time: {round(time.time() - start_time, 2)} sec"
+            )
 
-        print(
-            f"Batch: {batch_number} | "
-            f"Modified: {result.modified_count} | "
-            f"Total: {total_modified} | "
-            f"Time: {round(time.time() - start_time, 2)} sec"
-        )
+        print("Step 2 processing completed successfully!")
 
-    print("\nProcessing completed successfully!")
+    finally:
+        try:
+            if TEMP_INDEX_NAME in col.index_information():
+                col.drop_index(TEMP_INDEX_NAME)
+                print("Temporary index dropped successfully.")
+        except PyMongoError as index_error:
+            print(f"Index cleanup failed: {index_error}")
 
-except Exception as e:
-    print("ERROR:", str(e))
+        print("\nStep 2 Summary")
+        print(f"Total modified: {total_modified}")
+        print(f"Total batches: {batch_number}")
+        print(f"Total time: {round(time.time() - start_time, 2)} seconds\n")
 
-finally:
 
-    # 4. Drop temporary index
+def update_postgres_tables():
+    """Step 3 (PostgreSQL): Removes CPLE/CPLW from public.bas and updates BA to DUK in public.generators."""
+    print("--- Starting Step 3 (PostgreSQL) ---")
+    conn = None
+
+    delete_bas_sql = """
+        DELETE FROM public.bas
+        WHERE rc = 'VACAR' AND name IN ('CPLE', 'CPLW');
+    """
+
+    update_generators_sql = """
+        UPDATE public.generators
+        SET ba = 'DUK'
+        WHERE rc = 'VACAR' AND ba IN ('CPLE', 'CPLW');
+    """
+
     try:
-        if INDEX_NAME in col.index_information():
-            col.drop_index(INDEX_NAME)
-            print("Temporary index dropped successfully.")
+        conn = psycopg2.connect(**PG_CONFIG)
+        with conn:  # Automatically commits on success or rolls back on error
+            with conn.cursor() as cur:
+                cur.execute(delete_bas_sql)
+                print(f"Deleted {cur.rowcount} rows from public.bas.")
 
-    except Exception as index_error:
-        print("Index cleanup failed:", str(index_error))
+                cur.execute(update_generators_sql)
+                print(f"Updated {cur.rowcount} rows in public.generators.")
 
-    print("\nFinal Summary")
-    print("Total modified:", total_modified)
-    print("Total batches:", batch_number)
-    print("Total time:", round(time.time() - start_time, 2), "seconds")
+        print("Step 3 (PostgreSQL) completed successfully!\n")
 
-    client.close()
+    except psycopg2.Error as pg_err:
+        print(f"PostgreSQL error (changes rolled back): {pg_err}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+            print("PostgreSQL connection closed.")
+
+
+def main():
+    # --- Run MongoDB Tasks ---
+    mongo_client = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=30000,
+        socketTimeoutMS=None,
+    )
+
+    try:
+        db = mongo_client[MONGO_DB_NAME]
+        update_generation_collection(db)
+        update_sit_calculations_collection(db)
+    except PyMongoError as ex:
+        print(f"MongoDB error: {ex}")
+        return
+    except Exception as ex:
+        print(f"Unexpected MongoDB error: {ex}")
+        return
+    finally:
+        mongo_client.close()
+        print("MongoDB connection closed.\n")
+
+    # --- Run PostgreSQL Tasks ---
+    try:
+        update_postgres_tables()
+        print("All MongoDB and PostgreSQL migration tasks finished.")
+    except Exception:
